@@ -1,98 +1,122 @@
 //@version=5
 // ============================================================================
-// Overnight Gap Continuation & Fill Strategy (Gap-and-Go)
-// Muhammad Shayan Shahid (2212325) | Muhammad Amir (2212295)
-// SZABIST — Algorithmic Trading Final Project
+// Smart-RSI Strategy (Improved RSI-2 Mean Reversion) — SZABIST Final Project
+// Muhammad Shayan Shahid (2212325) | Muhammad Amir (2212295) | Instructor: Asif Khalid
+//
+// NOVEL ADDITION: "Volatility-Scaled Entry" (VSE)
+//   The classic RSI-2 uses ONE fixed oversold threshold in all conditions.
+//   Smart-RSI makes the entry threshold ADAPT to current volatility:
+//     - calm market  -> require a DEEPER dip (stricter, avoids false signals)
+//     - volatile market -> loosen slightly (catches sharper, higher-payoff bounces)
+//   This volatility-scaled RSI-2 entry is our own contribution.
 //
 // HOW TO USE:
-//   1. Open tradingview.com -> any chart (AAPL, TSLA, etc.) -> set timeframe to 1D
-//   2. Open the Pine Editor (bottom panel) -> paste this script -> "Add to chart"
-//   3. Green/red triangles = continuation trades, blue/orange = fill (fade) trades
-//   4. The stats table (top-right) shows live backtest results on the visible history
+//   tradingview.com -> SPY chart -> 1D timeframe -> press Alt+Z (Pine Editor)
+//   paste this -> "Add to chart". Green triangle = BUY (dip), red = SELL (exit).
+//   Stats panel (top-right) shows a live backtest on the visible history.
 //
-// LOGIC (identical to our Databricks notebook / research paper):
-//   Gap%  = (Open - PrevClose) / PrevClose * 100        [known at the open]
-//   ATR%  = Wilder ATR(14) of PREVIOUS bars / PrevClose [no look-ahead]
-//   RelVol = Volume / 20-day average volume
-//   CONTINUATION: |Gap%| >= K1*ATR%  AND RelVol >= VolMult  -> trade WITH the gap
-//   FILL (fade):  |Gap%| <= K2*ATR%  AND RelVol <  VolMult  -> trade AGAINST the gap
-//   All trades: enter at Open, exit at the same day's Close
+// IMPROVEMENTS over classic RSI-2:
+//   1. Volatility-Scaled Entry (the novel part)
+//   2. RSI-based exit (hold until momentum recovers) instead of MA-5 exit
+//   3. ATR stop-loss for dips that keep falling
 // ============================================================================
 
-indicator("Gap Continuation & Fill Strategy [SZABIST]", overlay = true, max_labels_count = 500)
+indicator("Smart-RSI [SZABIST]", overlay = true, max_labels_count = 500)
 
 // ---------------- Inputs ----------------
-atrLen   = input.int(14,    "ATR Period",                       minval = 2)
-k1       = input.float(1.0, "Continuation threshold K1 (xATR%)", minval = 0.1, step = 0.05)
-k2       = input.float(0.5, "Fill threshold K2 (xATR%)",         minval = 0.05, step = 0.05)
-volMult  = input.float(1.5, "Volume multiplier",                 minval = 0.5, step = 0.1)
-useVol   = input.bool(true, "Use volume filter (turn OFF for forex)")
-showFill = input.bool(true, "Show gap-fill target line")
+grpC="Core"
+rsiLen   = input.int(2,   "RSI length",            group=grpC, minval=1)
+trendLen = input.int(200, "Trend MA length",       group=grpC, minval=10)
+baseEntry= input.float(15,"Base entry RSI level",  group=grpC, step=1)
+rsiExit  = input.float(80,"RSI exit level",        group=grpC, step=1)
 
-// ---------------- Features (all known at the bar's open) ----------------
-prevClose = close[1]
-atrPrev   = ta.rma(ta.tr(true), atrLen)[1]          // Wilder ATR of previous bars
-atrPct    = atrPrev / prevClose * 100
-gapPct    = (open - prevClose) / prevClose * 100
-avgVol20  = ta.sma(volume, 20)[1]
-relVol    = avgVol20 > 0 ? volume / avgVol20 : 1.0
+grpV="Novel: Volatility-Scaled Entry"
+useVSE   = input.bool(true, "Enable Volatility-Scaled Entry", group=grpV)
+volLen   = input.int(100,  "Volatility lookback",  group=grpV, minval=20)
+vseSpan  = input.float(5,  "Max threshold shift",  group=grpV, step=1, tooltip="How much the entry RSI can move up/down with volatility")
 
-validBar  = not na(prevClose) and not na(atrPct) and atrPct > 0
-absGap    = math.abs(gapPct)
-volHigh   = not useVol or relVol >= volMult
-volLow    = not useVol or relVol <  volMult
+grpR="Risk"
+stopATR  = input.float(3.0,"ATR stop (x ATR)",     group=grpR, step=0.5)
+atrLen   = input.int(14,   "ATR length",           group=grpR)
 
-contLong  = validBar and gapPct >=  k1 * atrPct and volHigh   // gap UP, ride it
-contShort = validBar and gapPct <= -k1 * atrPct and volHigh   // gap DOWN, ride it
-fillLong  = validBar and gapPct < 0 and absGap <= k2 * atrPct and volLow  // small gap DOWN, fade up
-fillShort = validBar and gapPct > 0 and absGap <= k2 * atrPct and volLow  // small gap UP, fade down
+// ---------------- Indicators ----------------
+r   = ta.rsi(close, rsiLen)
+ma  = ta.sma(close, trendLen)
+atr = ta.atr(atrLen)
 
-anySignal = contLong or contShort or fillLong or fillShort
-sideLong  = contLong or fillLong
+// --- Volatility-Scaled Entry (NOVEL) ---
+// Normalised volatility: current ATR% vs its own recent range (0 = calm, 1 = very volatile)
+atrPct  = atr / close * 100
+loVol   = ta.lowest(atrPct, volLen)
+hiVol   = ta.highest(atrPct, volLen)
+volNorm = hiVol > loVol ? (atrPct - loVol) / (hiVol - loVol) : 0.5
+// calm (volNorm~0) -> stricter (lower RSI needed). volatile (volNorm~1) -> looser (higher RSI ok).
+entryLevel = useVSE ? baseEntry - vseSpan + (2 * vseSpan) * volNorm : baseEntry
+
+uptrend = close > ma
+
+// ---------------- Strategy state ----------------
+var bool inPos   = false
+var float entryP = na
+var float stopP  = na
+
+// remember if we were already in a position BEFORE this bar, so exits are
+// only checked on bars AFTER entry (prevents same-bar buy+sell artefacts)
+wasInPos = inPos
+
+buy = (not inPos) and uptrend and r < entryLevel
+if buy
+    inPos := true
+    entryP := close
+    stopP  := close - stopATR * atr
+
+// exits only valid if we were already holding at the start of this bar
+stopHit = wasInPos and inPos and low <= stopP
+rsiOut  = wasInPos and inPos and r >= rsiExit
+sell    = stopHit or rsiOut
+
+if sell
+    inPos := false
+    entryP := na
+    stopP  := na
 
 // ---------------- Plotting ----------------
-plotshape(contLong,  title = "Continuation LONG",  style = shape.triangleup,   location = location.belowbar, color = color.new(#16a085, 0), size = size.small, text = "GO ▲")
-plotshape(contShort, title = "Continuation SHORT", style = shape.triangledown, location = location.abovebar, color = color.new(#f23645, 0), size = size.small, text = "GO ▼")
-plotshape(fillLong,  title = "Fill LONG (fade)",   style = shape.triangleup,   location = location.belowbar, color = color.new(#2962ff, 0), size = size.small, text = "FILL")
-plotshape(fillShort, title = "Fill SHORT (fade)",  style = shape.triangledown, location = location.abovebar, color = color.new(#ff9800, 0), size = size.small, text = "FILL")
+plot(ma, "Trend MA (200)", color=color.new(#2962ff, 0), linewidth=2)
+plotshape(buy,     title="BUY",       style=shape.triangleup,   location=location.belowbar, color=color.new(#16a085,0), size=size.tiny, text="BUY",  textcolor=color.new(#16a085,0))
+plotshape(rsiOut,  title="SELL (RSI)",style=shape.triangledown, location=location.abovebar, color=color.new(#f23645,0), size=size.tiny, text="SELL", textcolor=color.new(#f23645,0))
+plotshape(stopHit, title="STOP",      style=shape.xcross,       location=location.abovebar, color=color.new(#ff9800,0), size=size.tiny, text="STOP", textcolor=color.new(#ff9800,0))
+bgcolor(inPos ? color.new(#16a085, 94) : na)
 
-bgcolor(anySignal ? color.new(sideLong ? #16a085 : #f23645, 92) : na)
-
-// Gap-fill target line: previous close, drawn on fade days
-if showFill and (fillLong or fillShort)
-    line.new(bar_index - 1, prevClose, bar_index, prevClose, color = color.new(#787b86, 30), style = line.style_dashed, width = 2)
-
-// ---------------- Built-in backtest stats (entry = open, exit = close) ----------------
-var int   nCont   = 0
-var int   nFill   = 0
+// ---------------- Live backtest stats ----------------
+var int   nTrades = 0
 var int   nWins   = 0
-var float cumRoi  = 0.0
+var float cumRet  = 0.0
+var float lastEntry = na
+if buy
+    lastEntry := close
+if sell and not na(lastEntry)
+    tr = (close - lastEntry) / lastEntry
+    nTrades += 1
+    nWins   += tr > 0 ? 1 : 0
+    cumRet  += tr
+    lastEntry := na
 
-tradeRoi = sideLong ? (close - open) / open : (open - close) / open
-
-if anySignal and barstate.isconfirmed
-    nCont  += (contLong or contShort) ? 1 : 0
-    nFill  += (fillLong or fillShort) ? 1 : 0
-    nWins  += tradeRoi > 0 ? 1 : 0
-    cumRoi += tradeRoi
-
-nTotal = nCont + nFill
-
-var table t = table.new(position.top_right, 2, 6, bgcolor = color.new(color.white, 10), border_width = 1, border_color = color.new(#787b86, 60))
+cHead=#1E222D, cRow=#131722, cTxt=#D1D4DC, cMut=#8A93A6, cUp=#16a085, cDn=#f23645
+var table t = table.new(position.top_right, 2, 6, bgcolor=cRow, border_width=1, border_color=#2A2E39, frame_width=1, frame_color=#2A2E39)
 if barstate.islast
-    table.cell(t, 0, 0, "Gap Strategy",        text_color = color.black, bgcolor = color.new(#2962ff, 75), text_size = size.small)
-    table.cell(t, 1, 0, syminfo.ticker + " 1D", text_color = color.black, bgcolor = color.new(#2962ff, 75), text_size = size.small)
-    table.cell(t, 0, 1, "Signals (total)",      text_color = color.black, text_size = size.small)
-    table.cell(t, 1, 1, str.tostring(nTotal),   text_color = color.black, text_size = size.small)
-    table.cell(t, 0, 2, "Continuation / Fill",  text_color = color.black, text_size = size.small)
-    table.cell(t, 1, 2, str.tostring(nCont) + " / " + str.tostring(nFill), text_color = color.black, text_size = size.small)
-    table.cell(t, 0, 3, "Win rate",             text_color = color.black, text_size = size.small)
-    table.cell(t, 1, 3, nTotal > 0 ? str.tostring(nWins * 100.0 / nTotal, "#.1") + "%" : "—", text_color = color.black, text_size = size.small)
-    table.cell(t, 0, 4, "Sum of trade ROI",     text_color = color.black, text_size = size.small)
-    table.cell(t, 1, 4, str.tostring(cumRoi * 100, "#.1") + "%", text_color = cumRoi >= 0 ? color.new(#16a085, 0) : color.new(#f23645, 0), text_size = size.small)
-    table.cell(t, 0, 5, "Today's Gap%",         text_color = color.black, text_size = size.small)
-    table.cell(t, 1, 5, str.tostring(gapPct, "#.2") + "%", text_color = color.black, text_size = size.small)
+    table.cell(t,0,0,"Smart-RSI", text_color=#FFFFFF, bgcolor=cHead, text_size=size.normal, text_halign=text.align_left)
+    table.cell(t,1,0,syminfo.ticker+" "+timeframe.period, text_color=cMut, bgcolor=cHead, text_size=size.small)
+    table.cell(t,0,1,"Trades", text_color=cMut, bgcolor=cRow, text_size=size.small, text_halign=text.align_left)
+    table.cell(t,1,1,str.tostring(nTrades), text_color=cTxt, bgcolor=cRow, text_size=size.small)
+    wr = nTrades>0 ? nWins*100.0/nTrades : 0
+    table.cell(t,0,2,"Win rate", text_color=cMut, bgcolor=cRow, text_size=size.small, text_halign=text.align_left)
+    table.cell(t,1,2,str.tostring(wr,"#.1")+"%", text_color=wr>=50?cUp:cDn, bgcolor=cRow, text_size=size.small)
+    table.cell(t,0,3,"Sum of returns", text_color=cMut, bgcolor=cRow, text_size=size.small, text_halign=text.align_left)
+    table.cell(t,1,3,str.tostring(cumRet*100,"#.1")+"%", text_color=cumRet>=0?cUp:cDn, bgcolor=cRow, text_size=size.small)
+    table.cell(t,0,4,"Entry level (now)", text_color=cMut, bgcolor=cRow, text_size=size.small, text_halign=text.align_left)
+    table.cell(t,1,4,str.tostring(entryLevel,"#.1"), text_color=cTxt, bgcolor=cRow, text_size=size.small)
+    table.cell(t,0,5,"RSI(2) now", text_color=cMut, bgcolor=cRow, text_size=size.small, text_halign=text.align_left)
+    table.cell(t,1,5,str.tostring(r,"#.1"), text_color=cTxt, bgcolor=cRow, text_size=size.small)
 
-// ---------------- Alerts (bonus: get notified of live signals) ----------------
-alertcondition(contLong or contShort, "Gap Continuation Signal", "Gap-and-Go: continuation signal on {{ticker}}")
-alertcondition(fillLong or fillShort, "Gap Fill Signal",         "Gap-and-Go: fill/fade signal on {{ticker}}")
+alertcondition(buy, "Smart-RSI BUY", "Smart-RSI buy (dip) on {{ticker}}")
+alertcondition(sell,"Smart-RSI SELL","Smart-RSI exit on {{ticker}}")
